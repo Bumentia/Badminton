@@ -1,0 +1,859 @@
+import React, { useState, useEffect } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, collection, addDoc, onSnapshot, query, doc, deleteDoc, updateDoc } from 'firebase/firestore';
+
+// Global variables for Firebase configuration provided by the Canvas environment
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// Helper function to handle async API calls with exponential backoff
+const fetchWithBackoff = async (url, options, retries = 3) => {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const response = await fetch(url, options);
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      return await response.json();
+    } catch (error) {
+      if (i < retries - 1) {
+        const delay = Math.pow(2, i) * 1000 + Math.random() * 1000;
+        await new Promise(resolve => setTimeout(resolve, delay));
+      } else {
+        console.error('API call failed after multiple retries:', error);
+        throw error;
+      }
+    }
+  }
+};
+
+// Main App Component
+const App = () => {
+  const [db, setDb] = useState(null);
+  const [userId, setUserId] = useState(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
+  const [registrations, setRegistrations] = useState([]);
+  const [coachSummary, setCoachSummary] = useState({});
+  const [daySummary, setDaySummary] = useState({});
+  const [studentName, setStudentName] = useState('');
+  const [parentName, setParentName] = useState('');
+  const [phone, setPhone] = useState('');
+  const [selectedCoach, setSelectedCoach] = useState('Coach Wut');
+  const [selectedDay, setSelectedDay] = useState('');
+  const [selectedDays, setSelectedDays] = useState([]); // New state for monthly registration
+  const [selectedTime, setSelectedTime] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [isFormSubmitting, setIsFormSubmitting] = useState(false);
+  const [showConfirmModal, setShowConfirmModal] = useState(false);
+  const [confirmMessage, setConfirmMessage] = useState('');
+  const [showCancelConfirmModal, setShowCancelConfirmModal] = useState(false);
+  const [cancelRegId, setCancelRegId] = useState(null);
+  const [registrationType, setRegistrationType] = useState('weekly');
+  const [pendingSchedule, setPendingSchedule] = useState([]);
+  const [lastConfirmedSchedule, setLastConfirmedSchedule] = useState([]);
+  
+  // New state variables for Admin functionality
+  const [isAdminAuthenticated, setIsAdminAuthenticated] = useState(false);
+  const [showAdminLoginModal, setShowAdminLoginModal] = useState(false);
+  const [adminPassword, setAdminPassword] = useState('');
+
+  // Define coaches with names and image URLs
+  const coaches = [
+    { name: 'Coach Wut', image: 'https://placehold.co/100x100/A0B9D8/ffffff?text=Wut' },
+    { name: 'Coach Tar', image: 'https://placehold.co/100x100/A0B9D8/ffffff?text=Tar' },
+    { name: 'Coach Bu', image: 'https://placehold.co/100x100/A0B9D8/ffffff?text=Bu' },
+  ];
+
+  const getCoachImage = (coachName) => {
+    const coach = coaches.find(c => c.name === coachName);
+    return coach ? coach.image : '';
+  };
+  
+  // Define days and times
+  const days = ['จันทร์', 'อังคาร', 'พุธ', 'พฤหัสบดี', 'ศุกร์', 'เสาร์', 'อาทิตย์'];
+  const times = [
+    '10:00 - 11:00', '11:00 - 12:00', '12:00 - 13:00', '13:00 - 14:00',
+    '14:00 - 15:00', '15:00 - 16:00', '16:00 - 17:00', '17:00 - 18:00',
+    '18:00 - 19:00', '19:00 - 20:00', '20:00 - 21:00', '21:00 - 22:00'
+  ];
+
+  // Check if a slot is booked by EITHER weekly or monthly registrations (handles old and new monthly formats)
+  const isSlotBookedAllTypes = (coach, day, time) => {
+    // Check against all existing registrations in Firestore
+    const isAlreadyBooked = registrations.some(reg =>
+      reg.coach === coach &&
+      reg.time === time &&
+      (
+        (reg.registrationType === 'weekly' && reg.day === day) ||
+        (reg.registrationType === 'monthly' && reg.selectedDays && reg.selectedDays.includes(day))
+      )
+    );
+
+    // Also check against the pending schedule
+    const isPendingBooked = pendingSchedule.some(reg => 
+      reg.coach === coach &&
+      reg.time === time &&
+      (
+        (reg.registrationType === 'weekly' && reg.day === day) ||
+        (reg.registrationType === 'monthly' && reg.selectedDays && reg.selectedDays.includes(day))
+      )
+    );
+
+    return isAlreadyBooked || isPendingBooked;
+  };
+
+  // Filter available times based on selected coach and day
+  const filteredTimes = selectedCoach && selectedDay ?
+    times.filter(time => !isSlotBookedAllTypes(selectedCoach, selectedDay, time)) : [];
+    
+  // Firebase Initialization and Authentication
+  useEffect(() => {
+    try {
+      const firebaseApp = initializeApp(firebaseConfig);
+      const firestoreDb = getFirestore(firebaseApp);
+      const firebaseAuth = getAuth(firebaseApp);
+
+      setDb(firestoreDb);
+
+      const unsubscribe = onAuthStateChanged(firebaseAuth, async (user) => {
+        if (user) {
+          setUserId(user.uid);
+          setIsAuthReady(true);
+        } else {
+          if (initialAuthToken) {
+            await signInWithCustomToken(firebaseAuth, initialAuthToken);
+          } else {
+            await signInAnonymously(firebaseAuth);
+          }
+        }
+      });
+      return () => unsubscribe();
+    } catch (e) {
+      console.error('Failed to initialize Firebase:', e);
+      setError('ไม่สามารถเชื่อมต่อกับฐานข้อมูลได้ กรุณาลองใหม่อีกครั้ง');
+    }
+  }, []);
+
+  // Fetch data from Firestore
+  useEffect(() => {
+    if (db && isAuthReady) {
+      setError(null);
+      setLoading(true);
+
+      // --- NEW: Change collection path to a public one for persistent data ---
+      const collectionPath = `/artifacts/${appId}/public/data/registrations`;
+      const q = query(collection(db, collectionPath));
+      
+      const unsubscribe = onSnapshot(q, (querySnapshot) => {
+        const registrationsData = [];
+        querySnapshot.forEach((doc) => {
+          registrationsData.push({ id: doc.id, ...doc.data() });
+        });
+        setRegistrations(registrationsData);
+        calculateCoachSummary(registrationsData);
+        calculateDaySummary(registrationsData);
+        setLoading(false);
+      }, (err) => {
+        console.error("Error fetching data:", err);
+        setError('ไม่สามารถดึงข้อมูลได้');
+        setLoading(false);
+      });
+      return () => unsubscribe();
+    }
+  }, [db, isAuthReady]); // Removed userId from dependency array as data is public now
+
+  // Calculate summary by coach
+  const calculateCoachSummary = (data) => {
+    const coachSum = {};
+    coaches.forEach(c => coachSum[c.name] = 0);
+    data.forEach(reg => {
+      const regCoach = reg.coach;
+      if (regCoach) {
+        coachSum[regCoach] = (coachSum[regCoach] || 0) + (reg.selectedDays ? reg.selectedDays.length : 1);
+      }
+    });
+    setCoachSummary(coachSum);
+  };
+
+  // Calculate summary by day (includes all registration types with a day property)
+  const calculateDaySummary = (data) => {
+    const daySum = {};
+    days.forEach(d => daySum[d] = 0);
+    data.forEach(reg => {
+      if (reg.registrationType === 'weekly' && reg.day) {
+        daySum[reg.day] = (daySum[reg.day] || 0) + 1;
+      } else if (reg.registrationType === 'monthly' && reg.selectedDays) {
+        reg.selectedDays.forEach(day => {
+          daySum[day] = (daySum[day] || 0) + 1;
+        });
+      }
+    });
+    setDaySummary(daySum);
+  };
+  
+  // Handle checkbox change for monthly registration
+  const handleDayCheckboxChange = (day) => {
+    setSelectedDays(prevSelectedDays => {
+        if (prevSelectedDays.includes(day)) {
+            return prevSelectedDays.filter(d => d !== day);
+        } else {
+            return [...prevSelectedDays, day];
+        }
+    });
+  };
+
+  // Add a registration to the pending schedule
+  const handleAddToSchedule = (e) => {
+    e.preventDefault();
+
+    if (!studentName || !parentName || !phone || !selectedCoach || !selectedTime) {
+        setConfirmMessage('กรุณากรอกข้อมูลให้ครบถ้วน');
+        setShowConfirmModal(true);
+        return;
+    }
+    
+    // Validation for weekly vs monthly
+    if (registrationType === 'weekly' && !selectedDay) {
+        setConfirmMessage('กรุณาเลือกวันและเวลาสำหรับลงทะเบียนรายสัปดาห์');
+        setShowConfirmModal(true);
+        return;
+    }
+    if (registrationType === 'monthly' && selectedDays.length === 0) {
+        setConfirmMessage('กรุณาเลือกอย่างน้อยหนึ่งวันสำหรับลงทะเบียนรายเดือน');
+        setShowConfirmModal(true);
+        return;
+    }
+    
+    const daysToCheck = registrationType === 'weekly' ? [selectedDay] : selectedDays;
+    
+    // Check for slot availability for all selected days
+    for (const day of daysToCheck) {
+        if (isSlotBookedAllTypes(selectedCoach, day, selectedTime)) {
+            setConfirmMessage(`ช่วงเวลาที่เลือกในวัน ${day} ถูกจองไปแล้ว กรุณาเลือกเวลาอื่น`);
+            setShowConfirmModal(true);
+            return;
+        }
+    }
+    
+    const newRegistration = {
+        studentName,
+        parentName,
+        phone,
+        coach: selectedCoach,
+        time: selectedTime,
+        registrationType,
+        paymentStatus: 'รอชำระเงิน', // New field
+        ...(registrationType === 'weekly' ? { day: selectedDay } : { selectedDays: selectedDays }),
+    };
+
+    setPendingSchedule(prev => [...prev, newRegistration]);
+    setConfirmMessage('เพิ่มรายการลงในตารางชั่วคราวแล้ว!');
+    setShowConfirmModal(true);
+    
+    // Clear selection fields for the next entry
+    setSelectedDay('');
+    setSelectedDays([]);
+    setSelectedTime('');
+  };
+
+  // Confirm and save all pending registrations to Firestore
+  const handleConfirmSchedule = async () => {
+    if (pendingSchedule.length === 0) {
+      setConfirmMessage('กรุณาเพิ่มรายการลงทะเบียนอย่างน้อยหนึ่งรายการ');
+      setShowConfirmModal(true);
+      return;
+    }
+
+    setIsFormSubmitting(true);
+    setLoading(true);
+    setLastConfirmedSchedule([]); // Clear previous confirmed schedule
+
+    try {
+        if (db) {
+            const collectionPath = `/artifacts/${appId}/public/data/registrations`;
+            const confirmedRegistrations = [];
+            for (const reg of pendingSchedule) {
+                const docRef = await addDoc(collection(db, collectionPath), {
+                    ...reg,
+                    timestamp: new Date().toISOString()
+                });
+                confirmedRegistrations.push({ ...reg, id: docRef.id });
+            }
+            setConfirmMessage('ยืนยันตารางเรียนทั้งหมดสำเร็จแล้ว!');
+            setShowConfirmModal(true);
+            setLastConfirmedSchedule(confirmedRegistrations); // Store for display
+            setPendingSchedule([]); // Clear pending schedule
+        }
+    } catch (e) {
+        console.error('Error adding documents: ', e);
+        setConfirmMessage('เกิดข้อผิดพลาดในการยืนยันตาราง กรุณาลองใหม่อีกครั้ง');
+        setShowConfirmModal(true);
+    } finally {
+        setIsFormSubmitting(false);
+        setLoading(false);
+    }
+  };
+
+  // Handle cancellation confirmation
+  const handleCancelRegistration = (id) => {
+    setCancelRegId(id);
+    setShowCancelConfirmModal(true);
+  };
+  
+  // Function to update payment status
+  const handlePaymentStatusChange = async (regId, newStatus) => {
+    if (!db || !isAdminAuthenticated) return;
+
+    try {
+        const collectionPath = `/artifacts/${appId}/public/data/registrations`;
+        const regRef = doc(db, collectionPath, regId);
+        await updateDoc(regRef, { paymentStatus: newStatus });
+        setConfirmMessage('อัปเดตสถานะการชำระเงินสำเร็จแล้ว!');
+        setShowConfirmModal(true);
+    } catch (e) {
+        console.error('Error updating document: ', e);
+        setConfirmMessage('เกิดข้อผิดพลาดในการอัปเดตสถานะ');
+        setShowConfirmModal(true);
+    }
+  };
+
+  // Execute cancellation
+  const confirmCancel = async () => {
+    if (!cancelRegId) return;
+    setLoading(true);
+    setShowCancelConfirmModal(false);
+
+    try {
+      if (db) {
+        const collectionPath = `/artifacts/${appId}/public/data/registrations`;
+        await deleteDoc(doc(db, collectionPath, cancelRegId));
+        setConfirmMessage('ยกเลิกการจองสำเร็จแล้ว!');
+        setShowConfirmModal(true);
+      }
+    } catch (e) {
+      console.error('Error deleting document: ', e);
+      setConfirmMessage('เกิดข้อผิดพลาดในการยกเลิกการจอง กรุณาลองใหม่อีกครั้ง');
+      setShowConfirmModal(true);
+    } finally {
+      setLoading(false);
+      setCancelRegId(null);
+    }
+  };
+
+  const handleCloseModal = () => {
+    setShowConfirmModal(false);
+    setShowCancelConfirmModal(false);
+    setShowAdminLoginModal(false);
+  };
+  
+  // Handle Admin Login
+  const handleAdminLogin = () => {
+    // Admin password check (for demo purposes)
+    if (adminPassword === 'badminton') {
+      setIsAdminAuthenticated(true);
+      setShowAdminLoginModal(false);
+      setAdminPassword('');
+    } else {
+      setConfirmMessage('รหัสผ่านไม่ถูกต้อง กรุณาลองใหม่อีกครั้ง');
+      setShowConfirmModal(true);
+    }
+  };
+
+  const renderUserView = () => (
+    <>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+        {/* Registration Form */}
+        <div className="mb-10">
+          <h2 className="text-2xl sm:text-3xl font-bold text-gray-800 mb-4 text-center">ฟอร์มลงทะเบียน</h2>
+          
+          {/* Registration Type Selector */}
+          <div className="mb-6 flex justify-center gap-4">
+            <button
+              type="button"
+              onClick={() => {
+                  setRegistrationType('weekly');
+                  setSelectedDay('');
+                  setSelectedDays([]);
+                  setSelectedTime('');
+              }}
+              className={`py-2 px-6 rounded-full font-semibold transition-all duration-300 ${
+                registrationType === 'weekly' ? 'bg-indigo-600 text-white shadow-lg' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+              }`}
+            >
+              ลงทะเบียนรายสัปดาห์
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                  setRegistrationType('monthly');
+                  setSelectedDay('');
+                  setSelectedDays([]);
+                  setSelectedTime('');
+              }}
+              className={`py-2 px-6 rounded-full font-semibold transition-all duration-300 ${
+                registrationType === 'monthly' ? 'bg-green-600 text-white shadow-lg' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+              }`}
+            >
+              ลงทะเบียนรายเดือน
+            </button>
+          </div>
+
+          <form onSubmit={handleAddToSchedule} className="space-y-6">
+            <div className="flex justify-center mb-6">
+                <img
+                    src={getCoachImage(selectedCoach)}
+                    alt={`รูปภาพของ ${selectedCoach}`}
+                    className="w-24 h-24 sm:w-32 sm:h-32 object-cover rounded-full border-4 border-indigo-500 shadow-md transition-transform duration-300 transform hover:scale-110"
+                />
+            </div>
+            <div>
+              <label htmlFor="studentName" className="block text-sm font-medium text-gray-700">ชื่อนักเรียน</label>
+              <input
+                type="text"
+                id="studentName"
+                value={studentName}
+                onChange={(e) => setStudentName(e.target.value)}
+                className="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-lg shadow-sm focus:ring-indigo-500 focus:border-indigo-500 transition-all duration-300"
+                placeholder="ชื่อ-นามสกุลนักเรียน"
+                required
+              />
+            </div>
+            <div>
+              <label htmlFor="parentName" className="block text-sm font-medium text-gray-700">ชื่อผู้ปกครอง</label>
+              <input
+                type="text"
+                id="parentName"
+                value={parentName}
+                onChange={(e) => setParentName(e.target.value)}
+                className="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-lg shadow-sm focus:ring-indigo-500 focus:border-indigo-500 transition-all duration-300"
+                placeholder="ชื่อ-นามสกุลผู้ปกครอง"
+                required
+              />
+            </div>
+            <div>
+              <label htmlFor="phone" className="block text-sm font-medium text-gray-700">เบอร์โทรศัพท์</label>
+              <input
+                type="tel"
+                id="phone"
+                value={phone}
+                onChange={(e) => setPhone(e.target.value)}
+                className="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-lg shadow-sm focus:ring-indigo-500 focus:border-indigo-500 transition-all duration-300"
+                placeholder="0xx-xxx-xxxx"
+                required
+              />
+            </div>
+            <div>
+              <label htmlFor="coach" className="block text-sm font-medium text-gray-700">โค้ช</label>
+              <select
+                id="coach"
+                value={selectedCoach}
+                onChange={(e) => {
+                  setSelectedCoach(e.target.value);
+                  setSelectedDay('');
+                  setSelectedDays([]);
+                  setSelectedTime('');
+                }}
+                className="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm rounded-lg"
+              >
+                {coaches.map(coach => (
+                  <option key={coach.name} value={coach.name}>{coach.name}</option>
+                ))}
+              </select>
+            </div>
+            
+            {/* Conditional Day/Days selection */}
+            {registrationType === 'weekly' ? (
+                <div>
+                  <label htmlFor="day" className="block text-sm font-medium text-gray-700">วัน</label>
+                  <select
+                    id="day"
+                    value={selectedDay}
+                    onChange={(e) => {
+                      setSelectedDay(e.target.value);
+                      setSelectedTime('');
+                    }}
+                    className="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm rounded-lg"
+                  >
+                    <option value="" disabled>เลือกวัน</option>
+                    {days.map(day => (
+                      <option key={day} value={day}>{day}</option>
+                    ))}
+                  </select>
+                </div>
+            ) : (
+                <div>
+                    <label className="block text-sm font-medium text-gray-700">วัน</label>
+                    <div className="mt-2 grid grid-cols-2 sm:grid-cols-4 gap-2">
+                        {days.map(day => (
+                            <div key={day} className="flex items-center">
+                                <input
+                                    id={`day-${day}`}
+                                    name="days"
+                                    type="checkbox"
+                                    checked={selectedDays.includes(day)}
+                                    onChange={() => handleDayCheckboxChange(day)}
+                                    className="h-4 w-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500"
+                                />
+                                <label htmlFor={`day-${day}`} className="ml-2 text-sm font-medium text-gray-700">
+                                    {day}
+                                </label>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            )}
+            
+            <div>
+              <label htmlFor="time" className="block text-sm font-medium text-gray-700">เวลา</label>
+              <select
+                id="time"
+                value={selectedTime}
+                onChange={(e) => setSelectedTime(e.target.value)}
+                className="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm rounded-lg"
+                disabled={registrationType === 'weekly' ? !selectedDay : selectedDays.length === 0}
+              >
+                <option value="" disabled>เลือกเวลา</option>
+                {/* Filtered times are for a single day, so we need to adjust logic here if we were to show this on monthly. */}
+                {/* For now, just show all times for simplicity on monthly as availability is checked on submit. */}
+                {(registrationType === 'weekly' && selectedDay) ? filteredTimes.map(time => (
+                  <option key={time} value={time}>{time}</option>
+                )) : times.map(time => (
+                    <option key={time} value={time}>{time}</option>
+                ))}
+              </select>
+            </div>
+            
+            <button
+              type="submit"
+              disabled={isFormSubmitting || (registrationType === 'weekly' && (!selectedDay || !selectedTime)) || (registrationType === 'monthly' && (selectedDays.length === 0 || !selectedTime))}
+              className="w-full inline-flex justify-center py-3 px-6 border border-transparent shadow-sm text-lg font-medium rounded-xl text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-all duration-300 transform hover:scale-105 disabled:bg-indigo-400 disabled:cursor-not-allowed"
+            >
+              {'เพิ่มลงในตาราง'}
+            </button>
+          </form>
+        </div>
+
+        {/* Pending & Confirmed Schedule Display */}
+        <div className="flex flex-col space-y-8">
+            {pendingSchedule.length > 0 && (
+              <div className="bg-gray-50 p-6 rounded-xl shadow-md">
+                  <h3 className="text-xl font-bold text-gray-800 mb-4">ตารางเรียนชั่วคราว</h3>
+                  <ul className="space-y-3">
+                      {pendingSchedule.map((reg, index) => (
+                          <li key={index} className="p-4 bg-white rounded-lg shadow-sm">
+                              <p className="text-lg font-semibold text-gray-900">{reg.studentName}</p>
+                              <p className="text-sm text-gray-600 mt-1">
+                                  <span className="font-medium">{reg.coach}</span> |{' '}
+                                  {reg.registrationType === 'weekly' ? `รายสัปดาห์: ${reg.day}, ${reg.time}` : `รายเดือน: ${reg.selectedDays.join(', ')}, ${reg.time}`}
+                              </p>
+                          </li>
+                      ))}
+                  </ul>
+                  <button
+                      onClick={handleConfirmSchedule}
+                      disabled={isFormSubmitting}
+                      className="mt-6 w-full inline-flex justify-center py-3 px-6 border border-transparent shadow-sm text-lg font-medium rounded-xl text-white bg-green-600 hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-green-500 transition-all duration-300 transform hover:scale-105 disabled:bg-green-400 disabled:cursor-not-allowed"
+                  >
+                      {isFormSubmitting ? 'กำลังยืนยัน...' : 'ยืนยันตารางทั้งหมด'}
+                  </button>
+              </div>
+            )}
+            
+            {lastConfirmedSchedule.length > 0 && (
+                <div className="bg-blue-50 p-6 rounded-xl shadow-md">
+                    <h3 className="text-xl font-bold text-blue-800 mb-4">ตารางเรียนที่ยืนยันแล้ว</h3>
+                    <ul className="space-y-3">
+                        {lastConfirmedSchedule.map((reg, index) => (
+                            <li key={index} className="p-4 bg-white rounded-lg shadow-sm">
+                                <p className="text-lg font-semibold text-blue-900">{reg.studentName}</p>
+                                <p className="text-sm text-gray-600 mt-1">
+                                    <span className="font-medium">{reg.coach}</span> |{' '}
+                                    {reg.registrationType === 'weekly' ? `รายสัปดาห์: ${reg.day}, ${reg.time}` : `รายเดือน: ${reg.selectedDays.join(', ')}, ${reg.time}`}
+                                </p>
+                            </li>
+                        ))}
+                    </ul>
+                </div>
+            )}
+        </div>
+      </div>
+    </>
+  );
+  
+  const renderAdminView = () => (
+    <>
+      <div className="mb-10">
+        <h2 className="text-2xl sm:text-3xl font-bold text-gray-800 mb-4 text-center">หน้าผู้ดูแลระบบ (Admin)</h2>
+        
+        {/* Logout Button */}
+        <div className="flex justify-end mb-4">
+          <button
+            onClick={() => setIsAdminAuthenticated(false)}
+            className="py-2 px-4 rounded-full font-semibold transition-all duration-300 bg-red-600 text-white shadow-lg hover:bg-red-700"
+          >
+            ออกจากระบบ
+          </button>
+        </div>
+        
+        {/* Summary Sections */}
+        <div className="mb-10">
+          <h2 className="text-xl font-bold text-gray-800 mb-4">สรุปยอดนักเรียน</h2>
+          {loading ? (
+            <div className="text-center text-gray-500">กำลังโหลดข้อมูล...</div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              {/* Coach Summary */}
+              <div className="bg-green-50 p-6 rounded-xl shadow-md">
+                <p className="text-lg font-semibold text-green-700 mb-3">ยอดรวมนักเรียนต่อโค้ช</p>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  {coaches.map(coach => (
+                    <div key={coach.name} className="p-4 bg-white rounded-lg shadow-sm text-center">
+                      <p className="text-md font-medium text-green-800">{coach.name}</p>
+                      <p className="text-2xl font-extrabold text-green-900 mt-1">{coachSummary[coach.name] || 0}</p>
+                      <p className="text-sm text-green-600">คน</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              
+              {/* Day Summary */}
+              <div className="bg-blue-50 p-6 rounded-xl shadow-md">
+                <p className="text-lg font-semibold text-blue-700 mb-3">ยอดรวมนักเรียนต่อวัน</p>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  {days.map(dayName => (
+                    <div key={dayName} className="p-4 bg-white rounded-lg shadow-sm text-center">
+                      <p className="text-md font-medium text-blue-800">{dayName}</p>
+                      <p className="text-2xl font-extrabold text-blue-900 mt-1">{daySummary[dayName] || 0}</p>
+                      <p className="text-sm text-blue-600">คน</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <hr className="my-10" />
+
+        {/* All Registrations Section */}
+        <div>
+          <h2 className="text-xl font-bold text-gray-800 mb-4">รายการลงทะเบียนทั้งหมด</h2>
+          <div className="overflow-x-auto shadow-md rounded-lg">
+            <table className="min-w-full divide-y divide-gray-200">
+              <thead className="bg-gray-50">
+                <tr>
+                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    นักเรียน
+                  </th>
+                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    ผู้ปกครอง
+                  </th>
+                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    เบอร์โทร
+                  </th>
+                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    โค้ช
+                  </th>
+                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    ประเภท
+                  </th>
+                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    รายละเอียด
+                  </th>
+                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    สถานะชำระเงิน
+                  </th>
+                  <th scope="col" className="relative px-6 py-3">
+                    <span className="sr-only">ยกเลิก</span>
+                  </th>
+                </tr>
+              </thead>
+              <tbody className="bg-white divide-y divide-gray-200">
+                {registrations.map((reg) => (
+                  <tr key={reg.id}>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                      {reg.studentName}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                      {reg.parentName}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                      {reg.phone}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                      {reg.coach || '-'}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                      {reg.registrationType === 'weekly' ? 'รายสัปดาห์' : 'รายเดือน'}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                      {reg.registrationType === 'weekly' ? `${reg.day}, ${reg.time}` : `${reg.selectedDays.join(', ')}, ${reg.time}`}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                        <select
+                          value={reg.paymentStatus}
+                          onChange={(e) => handlePaymentStatusChange(reg.id, e.target.value)}
+                          className="rounded-lg border-gray-300 shadow-sm focus:border-indigo-300 focus:ring focus:ring-indigo-200 focus:ring-opacity-50"
+                        >
+                          <option value="รอชำระเงิน">รอชำระเงิน</option>
+                          <option value="ชำระเงินแล้ว">ชำระเงินแล้ว</option>
+                          <option value="ยกเลิก">ยกเลิก</option>
+                        </select>
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                      <button
+                        onClick={() => handleCancelRegistration(reg.id)}
+                        className="text-red-600 hover:text-red-900 transition-colors duration-200"
+                      >
+                        ยกเลิก
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </>
+  );
+
+  return (
+    <div className="bg-gray-100 min-h-screen p-4 sm:p-8 font-sans">
+      <div className="max-w-6xl mx-auto bg-white shadow-xl rounded-2xl p-6 sm:p-10">
+        <header className="text-center mb-10">
+          <h1 className="text-4xl sm:text-5xl font-extrabold text-indigo-700 leading-tight">
+            ระบบลงทะเบียนเรียนแบดมินตัน
+          </h1>
+          <p className="mt-2 text-lg text-gray-600">จัดการการลงทะเบียนสำหรับนักเรียนแบดมินตัน</p>
+          {userId && (
+            <p className="mt-2 text-sm text-gray-500">
+              User ID: <span className="font-mono text-gray-700">{userId}</span>
+            </p>
+          )}
+          {/* View Switcher Button */}
+          <div className="mt-6 flex justify-center">
+            <button
+              onClick={() => {
+                if (isAuthReady) {
+                  if (isAuthReady && !isAdminAuthenticated) {
+                      setAdminPassword('');
+                      setShowAdminLoginModal(true);
+                  } else {
+                      setIsAdminAuthenticated(false);
+                  }
+                }
+              }}
+              className="py-2 px-6 rounded-full font-semibold transition-all duration-300 bg-purple-600 text-white shadow-lg hover:bg-purple-700 transform hover:scale-105"
+            >
+              {isAdminAuthenticated ? 'ออกจากระบบ Admin' : 'สลับไปหน้า Admin'}
+            </button>
+          </div>
+        </header>
+
+        {error && (
+          <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative mb-4" role="alert">
+            <span className="block sm:inline">{error}</span>
+          </div>
+        )}
+
+        {/* Conditional rendering based on currentView and authentication status */}
+        {isAdminAuthenticated ? renderAdminView() : renderUserView()}
+        
+        {/* General Confirmation Modal */}
+        {showConfirmModal && (
+          <div className="fixed inset-0 bg-gray-600 bg-opacity-75 overflow-y-auto h-full w-full flex justify-center items-center">
+            <div className="relative p-8 bg-white w-96 max-w-md m-auto flex-col flex rounded-2xl shadow-lg">
+              <div className="text-center">
+                <h3 className="text-lg font-medium text-gray-900">การแจ้งเตือน</h3>
+                <div className="mt-2 py-4">
+                  <p className="text-sm text-gray-500">{confirmMessage}</p>
+                </div>
+                <div className="mt-4">
+                  <button
+                    onClick={handleCloseModal}
+                    className="inline-flex justify-center rounded-xl border border-transparent bg-indigo-600 px-6 py-2 text-base font-medium text-white shadow-sm hover:bg-indigo-700 focus:outline-none"
+                  >
+                    ตกลง
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Cancellation Confirmation Modal */}
+        {showCancelConfirmModal && (
+          <div className="fixed inset-0 bg-gray-600 bg-opacity-75 overflow-y-auto h-full w-full flex justify-center items-center">
+            <div className="relative p-8 bg-white w-96 max-w-md m-auto flex-col flex rounded-2xl shadow-lg">
+              <div className="text-center">
+                <h3 className="text-lg font-medium text-gray-900">ยืนยันการยกเลิก</h3>
+                <div className="mt-2 py-4">
+                  <p className="text-sm text-gray-500">คุณต้องการยกเลิกการจองนี้ใช่ไหม?</p>
+                </div>
+                <div className="mt-4 flex justify-center gap-4">
+                  <button
+                    onClick={confirmCancel}
+                    className="inline-flex justify-center rounded-xl border border-transparent bg-red-600 px-6 py-2 text-base font-medium text-white shadow-sm hover:bg-red-700 focus:outline-none"
+                  >
+                    ใช่, ยกเลิก
+                  </button>
+                  <button
+                    onClick={handleCloseModal}
+                    className="inline-flex justify-center rounded-xl border border-gray-300 bg-white px-6 py-2 text-base font-medium text-gray-700 shadow-sm hover:bg-gray-50 focus:outline-none"
+                  >
+                    ไม่, เก็บไว้
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Admin Login Modal */}
+        {showAdminLoginModal && (
+          <div className="fixed inset-0 bg-gray-600 bg-opacity-75 overflow-y-auto h-full w-full flex justify-center items-center">
+            <div className="relative p-8 bg-white w-96 max-w-md m-auto flex-col flex rounded-2xl shadow-lg">
+              <div className="text-center">
+                <h3 className="text-lg font-medium text-gray-900">เข้าสู่ระบบ Admin</h3>
+                <div className="mt-4">
+                  <input
+                    type="password"
+                    value={adminPassword}
+                    onChange={(e) => setAdminPassword(e.target.value)}
+                    onKeyPress={(e) => {
+                      if (e.key === 'Enter') {
+                        handleAdminLogin();
+                      }
+                    }}
+                    className="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-lg shadow-sm focus:ring-purple-500 focus:border-purple-500"
+                    placeholder="กรอกรหัสผ่าน"
+                  />
+                </div>
+                <div className="mt-4 flex justify-center gap-4">
+                  <button
+                    onClick={handleAdminLogin}
+                    className="inline-flex justify-center rounded-xl border border-transparent bg-purple-600 px-6 py-2 text-base font-medium text-white shadow-sm hover:bg-purple-700 focus:outline-none"
+                  >
+                    เข้าสู่ระบบ
+                  </button>
+                  <button
+                    onClick={handleCloseModal}
+                    className="inline-flex justify-center rounded-xl border border-gray-300 bg-white px-6 py-2 text-base font-medium text-gray-700 shadow-sm hover:bg-gray-50 focus:outline-none"
+                  >
+                    ยกเลิก
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+export default App;
