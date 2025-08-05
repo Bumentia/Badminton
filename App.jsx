@@ -1,39 +1,8 @@
 import React, { useState, useEffect } from 'react';
-import { initializeApp } from 'firebase/app';
-import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
-import { getFirestore, collection, addDoc, onSnapshot, query, doc, deleteDoc, updateDoc } from 'firebase/firestore';
 
-// Global variables for Firebase configuration provided by the Canvas environment
-const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
-const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
-const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
-
-// Helper function to handle async API calls with exponential backoff
-const fetchWithBackoff = async (url, options, retries = 3) => {
-  for (let i = 0; i < retries; i++) {
-    try {
-      const response = await fetch(url, options);
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
-      return await response.json();
-    } catch (error) {
-      if (i < retries - 1) {
-        const delay = Math.pow(2, i) * 1000 + Math.random() * 1000;
-        await new Promise(resolve => setTimeout(resolve, delay));
-      } else {
-        console.error('API call failed after multiple retries:', error);
-        throw error;
-      }
-    }
-  }
-};
-
-// Main App Component
-const App = () => {
-  const [db, setDb] = useState(null);
-  const [userId, setUserId] = useState(null);
-  const [isAuthReady, setIsAuthReady] = useState(false);
+// The main App component containing all the application's logic and UI.
+function App() {
+  // State variables for managing the application's data and UI
   const [registrations, setRegistrations] = useState([]);
   const [coachSummary, setCoachSummary] = useState({});
   const [daySummary, setDaySummary] = useState({});
@@ -42,10 +11,9 @@ const App = () => {
   const [phone, setPhone] = useState('');
   const [selectedCoach, setSelectedCoach] = useState('Coach Wut');
   const [selectedDay, setSelectedDay] = useState('');
-  const [selectedDays, setSelectedDays] = useState([]); // New state for monthly registration
+  const [selectedDays, setSelectedDays] = useState([]);
   const [selectedTime, setSelectedTime] = useState('');
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(null);
   const [isFormSubmitting, setIsFormSubmitting] = useState(false);
   const [showConfirmModal, setShowConfirmModal] = useState(false);
   const [confirmMessage, setConfirmMessage] = useState('');
@@ -55,12 +23,11 @@ const App = () => {
   const [pendingSchedule, setPendingSchedule] = useState([]);
   const [lastConfirmedSchedule, setLastConfirmedSchedule] = useState([]);
   
-  // New state variables for Admin functionality
   const [isAdminAuthenticated, setIsAdminAuthenticated] = useState(false);
   const [showAdminLoginModal, setShowAdminLoginModal] = useState(false);
   const [adminPassword, setAdminPassword] = useState('');
 
-  // Define coaches with names and image URLs
+  // Static data for coaches, days, and times
   const coaches = [
     { name: 'Coach Wut', image: 'https://placehold.co/100x100/A0B9D8/ffffff?text=Wut' },
     { name: 'Coach Tar', image: 'https://placehold.co/100x100/A0B9D8/ffffff?text=Tar' },
@@ -72,7 +39,6 @@ const App = () => {
     return coach ? coach.image : '';
   };
   
-  // Define days and times
   const days = ['จันทร์', 'อังคาร', 'พุธ', 'พฤหัสบดี', 'ศุกร์', 'เสาร์', 'อาทิตย์'];
   const times = [
     '10:00 - 11:00', '11:00 - 12:00', '12:00 - 13:00', '13:00 - 14:00',
@@ -80,9 +46,48 @@ const App = () => {
     '18:00 - 19:00', '19:00 - 20:00', '20:00 - 21:00', '21:00 - 22:00'
   ];
 
-  // Check if a slot is booked by EITHER weekly or monthly registrations (handles old and new monthly formats)
+  // Function to load data from localStorage
+  const loadData = () => {
+    try {
+      const storedRegistrations = localStorage.getItem('badmintonRegistrations');
+      if (storedRegistrations) {
+        const data = JSON.parse(storedRegistrations);
+        setRegistrations(data);
+        calculateCoachSummary(data);
+        calculateDaySummary(data);
+      }
+    } catch (error) {
+      console.error('Failed to load data from localStorage', error);
+      // Fallback to empty state
+      setRegistrations([]);
+    }
+    setLoading(false);
+  };
+
+  // Function to save data to localStorage
+  const saveData = (data) => {
+    try {
+      localStorage.setItem('badmintonRegistrations', JSON.stringify(data));
+    } catch (error) {
+      console.error('Failed to save data to localStorage', error);
+    }
+  };
+
+  // useEffect hook to load data on initial component mount
+  useEffect(() => {
+    setLoading(true);
+    loadData();
+  }, []);
+
+  // useEffect hook to save data whenever the registrations state changes
+  useEffect(() => {
+    if (registrations.length > 0 || localStorage.getItem('badmintonRegistrations')) {
+      saveData(registrations);
+    }
+  }, [registrations]);
+
+  // Check if a time slot is already booked for any registration type
   const isSlotBookedAllTypes = (coach, day, time) => {
-    // Check against all existing registrations in Firestore
     const isAlreadyBooked = registrations.some(reg =>
       reg.coach === coach &&
       reg.time === time &&
@@ -92,7 +97,6 @@ const App = () => {
       )
     );
 
-    // Also check against the pending schedule
     const isPendingBooked = pendingSchedule.some(reg => 
       reg.coach === coach &&
       reg.time === time &&
@@ -105,67 +109,12 @@ const App = () => {
     return isAlreadyBooked || isPendingBooked;
   };
 
-  // Filter available times based on selected coach and day
-  const filteredTimes = selectedCoach && selectedDay ?
-    times.filter(time => !isSlotBookedAllTypes(selectedCoach, selectedDay, time)) : [];
-    
-  // Firebase Initialization and Authentication
-  useEffect(() => {
-    try {
-      const firebaseApp = initializeApp(firebaseConfig);
-      const firestoreDb = getFirestore(firebaseApp);
-      const firebaseAuth = getAuth(firebaseApp);
+  // Filter available times based on coach and day selection
+  const filteredTimes = selectedCoach && selectedDay
+    ? times.filter(time => !isSlotBookedAllTypes(selectedCoach, selectedDay, time))
+    : times;
 
-      setDb(firestoreDb);
-
-      const unsubscribe = onAuthStateChanged(firebaseAuth, async (user) => {
-        if (user) {
-          setUserId(user.uid);
-          setIsAuthReady(true);
-        } else {
-          if (initialAuthToken) {
-            await signInWithCustomToken(firebaseAuth, initialAuthToken);
-          } else {
-            await signInAnonymously(firebaseAuth);
-          }
-        }
-      });
-      return () => unsubscribe();
-    } catch (e) {
-      console.error('Failed to initialize Firebase:', e);
-      setError('ไม่สามารถเชื่อมต่อกับฐานข้อมูลได้ กรุณาลองใหม่อีกครั้ง');
-    }
-  }, []);
-
-  // Fetch data from Firestore
-  useEffect(() => {
-    if (db && isAuthReady) {
-      setError(null);
-      setLoading(true);
-
-      // --- NEW: Change collection path to a public one for persistent data ---
-      const collectionPath = `/artifacts/${appId}/public/data/registrations`;
-      const q = query(collection(db, collectionPath));
-      
-      const unsubscribe = onSnapshot(q, (querySnapshot) => {
-        const registrationsData = [];
-        querySnapshot.forEach((doc) => {
-          registrationsData.push({ id: doc.id, ...doc.data() });
-        });
-        setRegistrations(registrationsData);
-        calculateCoachSummary(registrationsData);
-        calculateDaySummary(registrationsData);
-        setLoading(false);
-      }, (err) => {
-        console.error("Error fetching data:", err);
-        setError('ไม่สามารถดึงข้อมูลได้');
-        setLoading(false);
-      });
-      return () => unsubscribe();
-    }
-  }, [db, isAuthReady]); // Removed userId from dependency array as data is public now
-
-  // Calculate summary by coach
+  // Calculate student summary for each coach
   const calculateCoachSummary = (data) => {
     const coachSum = {};
     coaches.forEach(c => coachSum[c.name] = 0);
@@ -178,7 +127,7 @@ const App = () => {
     setCoachSummary(coachSum);
   };
 
-  // Calculate summary by day (includes all registration types with a day property)
+  // Calculate student summary for each day
   const calculateDaySummary = (data) => {
     const daySum = {};
     days.forEach(d => daySum[d] = 0);
@@ -194,73 +143,73 @@ const App = () => {
     setDaySummary(daySum);
   };
   
-  // Handle checkbox change for monthly registration
+  // Handle checkbox changes for monthly registration days
   const handleDayCheckboxChange = (day) => {
     setSelectedDays(prevSelectedDays => {
-        if (prevSelectedDays.includes(day)) {
-            return prevSelectedDays.filter(d => d !== day);
-        } else {
-            return [...prevSelectedDays, day];
-        }
+      if (prevSelectedDays.includes(day)) {
+        return prevSelectedDays.filter(d => d !== day);
+      } else {
+        return [...prevSelectedDays, day];
+      }
     });
   };
 
-  // Add a registration to the pending schedule
+  // Handle adding a new registration to the pending schedule
   const handleAddToSchedule = (e) => {
     e.preventDefault();
 
     if (!studentName || !parentName || !phone || !selectedCoach || !selectedTime) {
-        setConfirmMessage('กรุณากรอกข้อมูลให้ครบถ้วน');
-        setShowConfirmModal(true);
-        return;
+      setConfirmMessage('กรุณากรอกข้อมูลให้ครบถ้วน');
+      setShowConfirmModal(true);
+      return;
     }
     
-    // Validation for weekly vs monthly
     if (registrationType === 'weekly' && !selectedDay) {
-        setConfirmMessage('กรุณาเลือกวันและเวลาสำหรับลงทะเบียนรายสัปดาห์');
-        setShowConfirmModal(true);
-        return;
+      setConfirmMessage('กรุณาเลือกวันและเวลาสำหรับลงทะเบียนรายสัปดาห์');
+      setShowConfirmModal(true);
+      return;
     }
     if (registrationType === 'monthly' && selectedDays.length === 0) {
-        setConfirmMessage('กรุณาเลือกอย่างน้อยหนึ่งวันสำหรับลงทะเบียนรายเดือน');
-        setShowConfirmModal(true);
-        return;
+      setConfirmMessage('กรุณาเลือกอย่างน้อยหนึ่งวันสำหรับลงทะเบียนรายเดือน');
+      setShowConfirmModal(true);
+      return;
     }
     
     const daysToCheck = registrationType === 'weekly' ? [selectedDay] : selectedDays;
     
-    // Check for slot availability for all selected days
     for (const day of daysToCheck) {
-        if (isSlotBookedAllTypes(selectedCoach, day, selectedTime)) {
-            setConfirmMessage(`ช่วงเวลาที่เลือกในวัน ${day} ถูกจองไปแล้ว กรุณาเลือกเวลาอื่น`);
-            setShowConfirmModal(true);
-            return;
-        }
+      if (isSlotBookedAllTypes(selectedCoach, day, selectedTime)) {
+        setConfirmMessage(`ช่วงเวลาที่เลือกในวัน ${day} ถูกจองไปแล้ว กรุณาเลือกเวลาอื่น`);
+        setShowConfirmModal(true);
+        return;
+      }
     }
     
     const newRegistration = {
-        studentName,
-        parentName,
-        phone,
-        coach: selectedCoach,
-        time: selectedTime,
-        registrationType,
-        paymentStatus: 'รอชำระเงิน', // New field
-        ...(registrationType === 'weekly' ? { day: selectedDay } : { selectedDays: selectedDays }),
+      id: Date.now() + Math.random(), // A simple unique ID
+      studentName,
+      parentName,
+      phone,
+      coach: selectedCoach,
+      time: selectedTime,
+      registrationType,
+      paymentStatus: 'รอชำระเงิน',
+      ...(registrationType === 'weekly' ? { day: selectedDay } : { selectedDays: selectedDays }),
+      timestamp: new Date().toISOString()
     };
 
     setPendingSchedule(prev => [...prev, newRegistration]);
     setConfirmMessage('เพิ่มรายการลงในตารางชั่วคราวแล้ว!');
     setShowConfirmModal(true);
     
-    // Clear selection fields for the next entry
+    // Reset form fields for the next entry
     setSelectedDay('');
     setSelectedDays([]);
     setSelectedTime('');
   };
 
-  // Confirm and save all pending registrations to Firestore
-  const handleConfirmSchedule = async () => {
+  // Handle confirming the pending schedule, moving it to main registrations
+  const handleConfirmSchedule = () => {
     if (pendingSchedule.length === 0) {
       setConfirmMessage('กรุณาเพิ่มรายการลงทะเบียนอย่างน้อยหนึ่งรายการ');
       setShowConfirmModal(true);
@@ -269,70 +218,60 @@ const App = () => {
 
     setIsFormSubmitting(true);
     setLoading(true);
-    setLastConfirmedSchedule([]); // Clear previous confirmed schedule
+    setLastConfirmedSchedule([]);
 
     try {
-        if (db) {
-            const collectionPath = `/artifacts/${appId}/public/data/registrations`;
-            const confirmedRegistrations = [];
-            for (const reg of pendingSchedule) {
-                const docRef = await addDoc(collection(db, collectionPath), {
-                    ...reg,
-                    timestamp: new Date().toISOString()
-                });
-                confirmedRegistrations.push({ ...reg, id: docRef.id });
-            }
-            setConfirmMessage('ยืนยันตารางเรียนทั้งหมดสำเร็จแล้ว!');
-            setShowConfirmModal(true);
-            setLastConfirmedSchedule(confirmedRegistrations); // Store for display
-            setPendingSchedule([]); // Clear pending schedule
-        }
+      const newRegistrations = [...registrations, ...pendingSchedule];
+      setRegistrations(newRegistrations);
+      setConfirmMessage('ยืนยันตารางเรียนทั้งหมดสำเร็จแล้ว!');
+      setShowConfirmModal(true);
+      setLastConfirmedSchedule(pendingSchedule);
+      setPendingSchedule([]);
     } catch (e) {
-        console.error('Error adding documents: ', e);
-        setConfirmMessage('เกิดข้อผิดพลาดในการยืนยันตาราง กรุณาลองใหม่อีกครั้ง');
-        setShowConfirmModal(true);
+      console.error('Error adding documents: ', e);
+      setConfirmMessage('เกิดข้อผิดพลาดในการยืนยันตาราง กรุณาลองใหม่อีกครั้ง');
+      setShowConfirmModal(true);
     } finally {
-        setIsFormSubmitting(false);
-        setLoading(false);
+      setIsFormSubmitting(false);
+      setLoading(false);
     }
   };
 
-  // Handle cancellation confirmation
+  // Handle click on the cancel registration button
   const handleCancelRegistration = (id) => {
     setCancelRegId(id);
     setShowCancelConfirmModal(true);
   };
   
-  // Function to update payment status
-  const handlePaymentStatusChange = async (regId, newStatus) => {
-    if (!db || !isAdminAuthenticated) return;
+  // Handle changing the payment status (Admin view)
+  const handlePaymentStatusChange = (regId, newStatus) => {
+    if (!isAdminAuthenticated) return;
 
     try {
-        const collectionPath = `/artifacts/${appId}/public/data/registrations`;
-        const regRef = doc(db, collectionPath, regId);
-        await updateDoc(regRef, { paymentStatus: newStatus });
-        setConfirmMessage('อัปเดตสถานะการชำระเงินสำเร็จแล้ว!');
-        setShowConfirmModal(true);
+      const updatedRegistrations = registrations.map(reg => 
+        reg.id === regId ? { ...reg, paymentStatus: newStatus } : reg
+      );
+      setRegistrations(updatedRegistrations);
+      setConfirmMessage('อัปเดตสถานะการชำระเงินสำเร็จแล้ว!');
+      setShowConfirmModal(true);
     } catch (e) {
-        console.error('Error updating document: ', e);
-        setConfirmMessage('เกิดข้อผิดพลาดในการอัปเดตสถานะ');
-        setShowConfirmModal(true);
+      console.error('Error updating document: ', e);
+      setConfirmMessage('เกิดข้อผิดพลาดในการอัปเดตสถานะ');
+      setShowConfirmModal(true);
     }
   };
 
-  // Execute cancellation
-  const confirmCancel = async () => {
+  // Final confirmation to cancel a registration
+  const confirmCancel = () => {
     if (!cancelRegId) return;
     setLoading(true);
     setShowCancelConfirmModal(false);
 
     try {
-      if (db) {
-        const collectionPath = `/artifacts/${appId}/public/data/registrations`;
-        await deleteDoc(doc(db, collectionPath, cancelRegId));
-        setConfirmMessage('ยกเลิกการจองสำเร็จแล้ว!');
-        setShowConfirmModal(true);
-      }
+      const updatedRegistrations = registrations.filter(reg => reg.id !== cancelRegId);
+      setRegistrations(updatedRegistrations);
+      setConfirmMessage('ยกเลิกการจองสำเร็จแล้ว!');
+      setShowConfirmModal(true);
     } catch (e) {
       console.error('Error deleting document: ', e);
       setConfirmMessage('เกิดข้อผิดพลาดในการยกเลิกการจอง กรุณาลองใหม่อีกครั้ง');
@@ -343,15 +282,15 @@ const App = () => {
     }
   };
 
+  // Close all modal dialogs
   const handleCloseModal = () => {
     setShowConfirmModal(false);
     setShowCancelConfirmModal(false);
     setShowAdminLoginModal(false);
   };
   
-  // Handle Admin Login
+  // Handle Admin login logic
   const handleAdminLogin = () => {
-    // Admin password check (for demo purposes)
     if (adminPassword === 'badminton') {
       setIsAdminAuthenticated(true);
       setShowAdminLoginModal(false);
@@ -362,14 +301,13 @@ const App = () => {
     }
   };
 
+  // JSX for the user view
   const renderUserView = () => (
     <>
       <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
-        {/* Registration Form */}
         <div className="mb-10">
           <h2 className="text-2xl sm:text-3xl font-bold text-gray-800 mb-4 text-center">ฟอร์มลงทะเบียน</h2>
           
-          {/* Registration Type Selector */}
           <div className="mb-6 flex justify-center gap-4">
             <button
               type="button"
@@ -464,7 +402,6 @@ const App = () => {
               </select>
             </div>
             
-            {/* Conditional Day/Days selection */}
             {registrationType === 'weekly' ? (
                 <div>
                   <label htmlFor="day" className="block text-sm font-medium text-gray-700">วัน</label>
@@ -516,12 +453,8 @@ const App = () => {
                 disabled={registrationType === 'weekly' ? !selectedDay : selectedDays.length === 0}
               >
                 <option value="" disabled>เลือกเวลา</option>
-                {/* Filtered times are for a single day, so we need to adjust logic here if we were to show this on monthly. */}
-                {/* For now, just show all times for simplicity on monthly as availability is checked on submit. */}
-                {(registrationType === 'weekly' && selectedDay) ? filteredTimes.map(time => (
+                {filteredTimes.map(time => (
                   <option key={time} value={time}>{time}</option>
-                )) : times.map(time => (
-                    <option key={time} value={time}>{time}</option>
                 ))}
               </select>
             </div>
@@ -536,7 +469,6 @@ const App = () => {
           </form>
         </div>
 
-        {/* Pending & Confirmed Schedule Display */}
         <div className="flex flex-col space-y-8">
             {pendingSchedule.length > 0 && (
               <div className="bg-gray-50 p-6 rounded-xl shadow-md">
@@ -582,13 +514,13 @@ const App = () => {
       </div>
     </>
   );
-  
+
+  // JSX for the admin view
   const renderAdminView = () => (
     <>
       <div className="mb-10">
         <h2 className="text-2xl sm:text-3xl font-bold text-gray-800 mb-4 text-center">หน้าผู้ดูแลระบบ (Admin)</h2>
         
-        {/* Logout Button */}
         <div className="flex justify-end mb-4">
           <button
             onClick={() => setIsAdminAuthenticated(false)}
@@ -598,14 +530,12 @@ const App = () => {
           </button>
         </div>
         
-        {/* Summary Sections */}
         <div className="mb-10">
           <h2 className="text-xl font-bold text-gray-800 mb-4">สรุปยอดนักเรียน</h2>
           {loading ? (
             <div className="text-center text-gray-500">กำลังโหลดข้อมูล...</div>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-              {/* Coach Summary */}
               <div className="bg-green-50 p-6 rounded-xl shadow-md">
                 <p className="text-lg font-semibold text-green-700 mb-3">ยอดรวมนักเรียนต่อโค้ช</p>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -619,7 +549,6 @@ const App = () => {
                 </div>
               </div>
               
-              {/* Day Summary */}
               <div className="bg-blue-50 p-6 rounded-xl shadow-md">
                 <p className="text-lg font-semibold text-blue-700 mb-3">ยอดรวมนักเรียนต่อวัน</p>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -638,7 +567,6 @@ const App = () => {
 
         <hr className="my-10" />
 
-        {/* All Registrations Section */}
         <div>
           <h2 className="text-xl font-bold text-gray-800 mb-4">รายการลงทะเบียนทั้งหมด</h2>
           <div className="overflow-x-auto shadow-md rounded-lg">
@@ -721,6 +649,7 @@ const App = () => {
     </>
   );
 
+  // The main application JSX structure
   return (
     <div className="bg-gray-100 min-h-screen p-4 sm:p-8 font-sans">
       <div className="max-w-6xl mx-auto bg-white shadow-xl rounded-2xl p-6 sm:p-10">
@@ -729,22 +658,14 @@ const App = () => {
             ระบบลงทะเบียนเรียนแบดมินตัน
           </h1>
           <p className="mt-2 text-lg text-gray-600">จัดการการลงทะเบียนสำหรับนักเรียนแบดมินตัน</p>
-          {userId && (
-            <p className="mt-2 text-sm text-gray-500">
-              User ID: <span className="font-mono text-gray-700">{userId}</span>
-            </p>
-          )}
-          {/* View Switcher Button */}
           <div className="mt-6 flex justify-center">
             <button
               onClick={() => {
-                if (isAuthReady) {
-                  if (isAuthReady && !isAdminAuthenticated) {
-                      setAdminPassword('');
-                      setShowAdminLoginModal(true);
-                  } else {
-                      setIsAdminAuthenticated(false);
-                  }
+                if (!isAdminAuthenticated) {
+                  setAdminPassword('');
+                  setShowAdminLoginModal(true);
+                } else {
+                  setIsAdminAuthenticated(false);
                 }
               }}
               className="py-2 px-6 rounded-full font-semibold transition-all duration-300 bg-purple-600 text-white shadow-lg hover:bg-purple-700 transform hover:scale-105"
@@ -754,16 +675,9 @@ const App = () => {
           </div>
         </header>
 
-        {error && (
-          <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative mb-4" role="alert">
-            <span className="block sm:inline">{error}</span>
-          </div>
-        )}
-
-        {/* Conditional rendering based on currentView and authentication status */}
         {isAdminAuthenticated ? renderAdminView() : renderUserView()}
         
-        {/* General Confirmation Modal */}
+        {/* Modals for various user interactions */}
         {showConfirmModal && (
           <div className="fixed inset-0 bg-gray-600 bg-opacity-75 overflow-y-auto h-full w-full flex justify-center items-center">
             <div className="relative p-8 bg-white w-96 max-w-md m-auto flex-col flex rounded-2xl shadow-lg">
@@ -785,7 +699,6 @@ const App = () => {
           </div>
         )}
 
-        {/* Cancellation Confirmation Modal */}
         {showCancelConfirmModal && (
           <div className="fixed inset-0 bg-gray-600 bg-opacity-75 overflow-y-auto h-full w-full flex justify-center items-center">
             <div className="relative p-8 bg-white w-96 max-w-md m-auto flex-col flex rounded-2xl shadow-lg">
@@ -813,7 +726,6 @@ const App = () => {
           </div>
         )}
 
-        {/* Admin Login Modal */}
         {showAdminLoginModal && (
           <div className="fixed inset-0 bg-gray-600 bg-opacity-75 overflow-y-auto h-full w-full flex justify-center items-center">
             <div className="relative p-8 bg-white w-96 max-w-md m-auto flex-col flex rounded-2xl shadow-lg">
@@ -854,6 +766,6 @@ const App = () => {
       </div>
     </div>
   );
-};
+}
 
 export default App;
